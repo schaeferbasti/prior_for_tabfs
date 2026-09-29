@@ -1,19 +1,16 @@
 import pandas as pd
 
-from utils.metafeature_extraction.metafeature_extractor import get_pandas_metadata
+from utils.build_nanotabpfn_prior import build_feature_metadata_prior
+from utils.metafeature_extraction.metafeature_extractor import get_dataset_metadata
 
 import random
-import time
 
 import h5py
 import numpy as np
-import schedulefree
 import torch
-from utils.tfm.tfm import NanoTabPFNClassifier, NanoTabPFNModel
+from utils.tfm.tfm import NanoTabPFNModel, train
 from sklearn.datasets import *
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from torch import nn
 from torch.utils.data import DataLoader
 
 
@@ -32,100 +29,6 @@ def get_default_device():
 
 datasets = []
 datasets.append(train_test_split(*load_breast_cancer(return_X_y=True), test_size=0.5, random_state=0))
-
-def eval(classifier):
-    scores = {
-        "roc_auc": 0,
-        "acc": 0,
-        "balanced_acc": 0
-    }
-    for  X_train, X_test, y_train, y_test in datasets:
-         classifier.fit(X_train, y_train)
-         prob = classifier.predict_proba(X_test)
-         pred = prob.argmax(axis=1) # avoid a second forward pass by not calling predict
-         if prob.shape[1]==2:
-             prob = prob[:,1]
-         scores["roc_auc"] += float(roc_auc_score(y_test, prob, multi_class="ovr"))
-         scores["acc"] += float(accuracy_score(y_test, pred))
-         scores["balanced_acc"] += float(balanced_accuracy_score(y_test, pred))
-    scores = {k:v/len(datasets) for k,v in scores.items()}
-    return scores
-
-def train(model: NanoTabPFNModel, prior: DataLoader,
-          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None):
-    """
-    Trains our model on the given prior using the given criterion.
-
-    Args:
-        model: (NanoTabPFNModel) our PyTorch model
-        prior: (DataLoader) torch-compatible dataloader
-        lr: (float) learning rate
-        device: (torch.device) the device we are using
-        steps_per_eval: (int) how many steps we wait before running evaluation again
-        eval_func: a function that takes in a classifier and returns a dict containing the average scores
-                   for some metrics and datasets
-
-    Returns:
-        (model) our trained numpy model
-        (list) a list containing our eval history, each entry is the real time used for training so far together
-               with a dict mapping metric names to their average values accross a list of datasets
-    """
-    if not device:
-        device = get_default_device()
-    model.to(device)
-    optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
-    criterion = nn.CrossEntropyLoss()
-
-    model.train()
-    optimizer.train()
-
-    train_time = 0
-    eval_history=[]
-    try:
-        for step, full_data in enumerate(prior):
-            step_start_time = time.time()
-            train_test_split_index = full_data["train_test_split_index"]
-            #if (torch.isnan(data[0]).any() or torch.isnan(data[1]).any()):
-            #    continue
-            data = (full_data["x"].to(device),
-                    full_data["y"][:, :train_test_split_index].to(device))
-            targets = full_data["y"].to(device)
-
-            output = model(data, train_test_split_index=train_test_split_index)
-            targets = targets[:, train_test_split_index:]
-
-            targets = targets.reshape((-1,)).to(torch.long)
-            output = output.view(-1, output.shape[-1])
-
-            loss = criterion(output, targets).mean()
-            loss.backward()
-            total_loss = loss.item()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-            optimizer.step()
-            optimizer.zero_grad()
-            step_train_duration = time.time() - step_start_time
-            train_time += step_train_duration
-
-            # evaluate
-            if step % steps_per_eval == steps_per_eval-1 and eval_func is not None:
-                model.eval()
-                optimizer.eval()
-
-                classifier = NanoTabPFNClassifier(model, device)
-                scores = eval_func(classifier)
-                eval_history.append((train_time, scores))
-                score_str = " | ".join([f"{k} {v:7.4f}" for k,v in scores.items()])
-                print(f"time {train_time:7.1f}s | loss {total_loss:7.4f} | {score_str}")
-
-                model.train()
-                optimizer.train()
-            elif step % steps_per_eval == steps_per_eval-1 and eval_func is None:
-                print(f"time {train_time:7.1f}s | loss {total_loss:7.4f}")
-    except KeyboardInterrupt:
-        pass
-
-    return model, eval_history
 
 
 class PriorDumpDataLoader(DataLoader):
@@ -175,15 +78,46 @@ class PriorDumpDataLoader(DataLoader):
         return self.num_steps
 
 
+def iter_prior_tasks(filename, max_tasks=None):
+    """
+    Yield individual, unpadded tasks from the HDF5 prior.
+
+    Assumes the HDF5 layout used by your PriorDumpDataLoader:
+    X[task, row, feature], y[task, row],
+    num_features[task], num_datapoints[task],
+    single_eval_pos[task].
+    """
+    with h5py.File(filename, "r") as f:
+        total_tasks = f["X"].shape[0]
+        if max_tasks is not None:
+            total_tasks = min(total_tasks, max_tasks)
+
+        for task_id in range(total_tasks):
+            n_rows = int(f["num_datapoints"][task_id])
+            n_features = int(f["num_features"][task_id])
+
+            X = f["X"][task_id, :n_rows, :n_features]
+            y = f["y"][task_id, :n_rows]
+
+            columns = [f"f{j}" for j in range(n_features)]
+            X_task = pd.DataFrame(X, columns=columns)
+
+            yield (
+                task_id,
+                X_task.copy(),
+                np.asarray(y),
+            )
+
+
 def evaluate_features(old_prior):
     return 1
 
-def run_exhaustive_feature_selection(old_prior):
-    performance_column = pd.DataFrame(index=old_prior.columns, columns=["improvement"])
+def run_leave_one_feature_out(X_train):
+    performance_column = pd.DataFrame(index=X_train.columns, columns=["improvement"])
     # Do exhaustive feature selection
-    full_score = float(evaluate_features(old_prior))
-    for feature_name in old_prior.columns:
-        X_without_feature = old_prior.drop(columns=feature_name)
+    full_score = float(evaluate_features(X_train))
+    for feature_name in X_train.columns:
+        X_without_feature = X_train.drop(columns=feature_name)
         score_without_feature = float(evaluate_features(X_without_feature))
         improvement = full_score - score_without_feature
         performance_column.loc[feature_name, "improvement"] = improvement
@@ -191,20 +125,32 @@ def run_exhaustive_feature_selection(old_prior):
 
 def main():
     device = get_default_device()
-
-    # Get Old Prior
-    # old_prior = pd.read_parquet("../../data/old_prior.parquet")
-    old_prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=2500, batch_size=32, device=device)
-
+    filename = "../data/prior/300k_150x5_2.h5"
+    old_prior = PriorDumpDataLoader(filename, num_steps=2500, batch_size=32, device=device)
+    new_prior = []
     # Calculate Metafeatures
-    metafeatures_old_prior = get_pandas_metadata(old_prior)
+    for task_id, X_train, y_train in iter_prior_tasks(filename, max_tasks=10):
+        metafeatures_old_prior_task = get_dataset_metadata(X_train, task_id)
 
-    # Calc Exhaustive Feature Selection
-    performance_column = run_exhaustive_feature_selection(old_prior)
+        # Calc Exhaustive Feature Selection
+        performance = run_leave_one_feature_out(X_train)
 
-    # Save Result
-    new_prior = pd.concat(metafeatures_old_prior, performance_column)
-    new_prior.save_parquet("../../data/new_prior.parquet")
+        # Save Result
+        new_prior_task = metafeatures_old_prior_task.join(
+            performance,
+            how="left",
+            validate="one_to_one",
+        )
+        new_prior.append(new_prior_task)
+
+    new_prior = pd.concat(new_prior, ignore_index=True)
+    build_feature_metadata_prior(
+        feature_table=new_prior,
+        output_path="../data/prior/new_prior.h5",
+        target_mode="binary",
+        test_fraction=0.2,
+        random_state=0,
+    )
 
     model = NanoTabPFNModel(
         embedding_size=96,

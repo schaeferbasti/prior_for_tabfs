@@ -5,7 +5,8 @@ This project is the code basis to study the design of an prior for feature selec
 
 ## Pretraining
 To pretrain nanoPFN, you need to download the prior data dump at first:
-curl -L -o 300k_150x5_2.h5 "https://ndownloader.figshare.com/files/58932628?private_link=63fc1ada93e42e388e63"
+mkdir -p data/prior
+curl -L -o data/prior/300k_150x5_2.h5 "https://ndownloader.figshare.com/files/58932628?private_link=63fc1ada93e42e388e63"
 
 Secondly, run_pretraining_pipeline.py can be executed.
 

@@ -32,7 +32,7 @@ def check_and_complete_pandas_description(feature_pandas_description):
     return feature_pandas_description
 
 
-def get_pandas_metafeatures(feature_df, featurename):
+def get_feature_metafeatures(feature_df, featurename):
     feature_pandas_description = feature_df.describe(include="all")
     feature_pandas_description = check_and_complete_pandas_description(feature_pandas_description)
     feature_metadata = {
@@ -51,12 +51,12 @@ def get_pandas_metafeatures(feature_df, featurename):
     return feature_metadata
 
 
-def get_pandas_metadata(X_train, task_id):
+def get_dataset_metadata(X_train, task_id):
     columns = get_pandas_metafeature_names()
     pandas_metadata = pd.DataFrame(index=X_train.columns, columns=columns)
     for feature_name in X_train.columns:
         feature = pd.DataFrame(X_train[feature_name])
-        feature_metadata = get_pandas_metafeatures(feature, feature_name)
+        feature_metadata = get_feature_metafeatures(feature, feature_name)
         pandas_metadata.loc[feature_name] = [
             task_id,
             feature_name,
@@ -77,7 +77,7 @@ def get_pandas_metadata(X_train, task_id):
 
 def main():
     test_dataset = pd.read_parquet("../../data/test_dataset.parquet")
-    metafeatures_test_dataset = get_pandas_metadata(test_dataset)
+    metafeatures_test_dataset = get_dataset_metadata(test_dataset)
     metafeatures_test_dataset.to_parquet("../../data/metafeatures_test_dataset.parquet")
 
 
