@@ -3,7 +3,7 @@ import pandas as pd
 
 
 def get_pandas_metafeature_names():
-    return ['feature - count', 'feature - unique', 'feature - top', 'feature - freq', 'feature - mean', 'feature - std', 'feature - min', 'feature - 25%', 'feature - 50%', 'feature - 75%', 'feature - max']
+    return ['task_id', 'feature', 'feature - count', 'feature - unique', 'feature - top', 'feature - freq', 'feature - mean', 'feature - std', 'feature - min', 'feature - 25%', 'feature - 50%', 'feature - 75%', 'feature - max']
 
 
 def check_and_complete_pandas_description(feature_pandas_description):
@@ -51,13 +51,15 @@ def get_pandas_metafeatures(feature_df, featurename):
     return feature_metadata
 
 
-def get_pandas_metadata(X_train):
+def get_pandas_metadata(X_train, task_id):
     columns = get_pandas_metafeature_names()
     pandas_metadata = pd.DataFrame(index=X_train.columns, columns=columns)
     for feature_name in X_train.columns:
         feature = pd.DataFrame(X_train[feature_name])
         feature_metadata = get_pandas_metafeatures(feature, feature_name)
         pandas_metadata.loc[feature_name] = [
+            task_id,
+            feature_name,
             feature_metadata["feature - count"],
             feature_metadata["feature - unique"],
             feature_metadata["feature - top"],
