@@ -14,6 +14,7 @@ from utils.nanoTabPFN_utils import get_default_device
 
 
 class NanoTabPFNModel(nn.Module):
+    # TODO: change the TFM so that it can deal with the new prior, doesn't use X_test in inference and uses attention pooling to collapse the rows
     def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int):
         """ Initializes the feature/target encoder, transformer stack and decoder """
         super().__init__()
@@ -237,8 +238,6 @@ def train(model: NanoTabPFNModel, prior: DataLoader, lr: float = 1e-4, device: t
         for step, full_data in enumerate(prior):
             step_start_time = time.time()
             train_test_split_index = full_data["train_test_split_index"]
-            #if (torch.isnan(data[0]).any() or torch.isnan(data[1]).any()):
-            #    continue
             data = (full_data["x"].to(device),
                     full_data["y"][:, :train_test_split_index].to(device))
             targets = full_data["y"].to(device)
