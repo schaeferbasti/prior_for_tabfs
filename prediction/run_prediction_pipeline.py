@@ -35,17 +35,22 @@ def main():
     clf = NanoTabPFNClassifier(model, device)
     rng = np.random.default_rng(seed=42)
     y = pd.Series(
-        rng.integers(0, 1, size=len(metafeatures_test_dataset)),
+        rng.integers(0, 2, size=len(metafeatures_test_dataset)),
         index=metafeatures_test_dataset.index,
         name="improvement",
+    ).to_numpy()
+
+    X_df = metafeatures_test_dataset.drop(
+        columns=["task_id", "feature", "feature - top"]
     )
-    X_train, X_test, y_train, y_test = train_test_split(metafeatures_test_dataset, y, test_size=0.5)
+    X_df = X_df.apply(pd.to_numeric, errors="coerce")
+    X = X_df.fillna(0.0).to_numpy(dtype=np.float32)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
 
     clf.fit(X_train, y_train)
-    prob = clf.predict_proba(X_test)
     pred = clf.predict(X_test)
-    print('ROC AUC', roc_auc_score(y_test, prob))
-    print('Accuracy', accuracy_score(y_test, pred))
+    print(pred)
 
 
 if __name__ == "__main__":
