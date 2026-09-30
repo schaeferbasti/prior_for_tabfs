@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.modules.transformer import MultiheadAttention, Linear, LayerNorm
 
+from utils.prior_tools import get_default_device
+
+
 class NanoTabPFNModel(nn.Module):
     def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int):
         """ Initializes the feature/target encoder, transformer stack and decoder """
@@ -199,12 +202,6 @@ class NanoTabPFNClassifier():
         predicted_probabilities = self.predict_proba(X_test)
         return predicted_probabilities.argmax(axis=1)
 
-
-def get_default_device():
-    device = "cpu"
-    if torch.backends.mps.is_available(): device = "mps"
-    if torch.cuda.is_available(): device = "cuda"
-    return device
 
 def train(model: NanoTabPFNModel, prior: DataLoader,
           lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None):
