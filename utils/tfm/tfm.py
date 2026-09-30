@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.modules.transformer import MultiheadAttention, Linear, LayerNorm
 
-from utils.prior_tools import get_default_device
+from utils.nanoTabPFN_utils import get_default_device
 
 
 class NanoTabPFNModel(nn.Module):

@@ -1,6 +1,6 @@
 import pandas as pd
 
-from utils.prior_tools import build_feature_metadata_prior, get_default_device, PriorDumpDataLoader, iter_prior_tasks
+from utils.nanoTabPFN_utils import build_feature_metadata_prior, get_default_device, PriorDumpDataLoader, iter_prior_tasks
 from utils.metafeature_extraction.metafeature_extractor import get_dataset_metadata
 from utils.tfm.tfm import NanoTabPFNModel, train
 
