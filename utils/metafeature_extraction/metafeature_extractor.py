@@ -51,7 +51,7 @@ def get_feature_metafeatures(feature_df, featurename):
     return feature_metadata
 
 
-def get_dataset_metadata(X_train, task_id):
+def get_dataset_metafeatures(X_train, task_id):
     columns = get_pandas_metafeature_names()
     pandas_metadata = pd.DataFrame(index=X_train.columns, columns=columns)
     for feature_name in X_train.columns:
@@ -77,7 +77,7 @@ def get_dataset_metadata(X_train, task_id):
 
 def main():
     test_dataset = pd.read_parquet("../../data/test_dataset.parquet")
-    metafeatures_test_dataset = get_dataset_metadata(test_dataset)
+    metafeatures_test_dataset = get_dataset_metafeatures(test_dataset)
     metafeatures_test_dataset.to_parquet("../../data/metafeatures_test_dataset.parquet")
 
 

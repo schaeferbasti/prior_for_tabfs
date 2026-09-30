@@ -1,13 +1,12 @@
-import pandas as pd
-
-from utils.nanoTabPFN_utils import build_feature_metadata_prior, get_default_device, PriorDumpDataLoader, iter_prior_tasks
-from utils.metafeature_extraction.metafeature_extractor import get_dataset_metadata
-from utils.tfm.tfm import NanoTabPFNModel, train
-
 import random
 
+import pandas as pd
 import numpy as np
 import torch
+
+from utils.nanoTabPFN_utils import build_feature_metadata_prior, get_default_device, PriorDumpDataLoader, iter_prior_tasks
+from utils.metafeature_extraction.metafeature_extractor import get_dataset_metafeatures
+from utils.tfm.tfm import NanoTabPFNModel, train
 
 
 def set_randomness_seed(seed):
@@ -17,12 +16,12 @@ def set_randomness_seed(seed):
 
 
 def evaluate_features(old_prior):
-    return 1
+    return random.random()
 
 def run_leave_one_feature_out(X_train):
     performance_column = pd.DataFrame(index=X_train.columns, columns=["improvement"])
     # Do exhaustive feature selection
-    full_score = float(evaluate_features(X_train))
+    full_score = 1.0  # float(evaluate_features(X_train))
     for feature_name in X_train.columns:
         X_without_feature = X_train.drop(columns=feature_name)
         score_without_feature = float(evaluate_features(X_without_feature))
@@ -35,7 +34,7 @@ def main():
     new_prior = []
     # Calculate Metafeatures
     for task_id, X_train, y_train in iter_prior_tasks(old_prior, max_tasks=10):
-        metafeatures_old_prior_task = get_dataset_metadata(X_train, task_id)
+        metafeatures_old_prior_task = get_dataset_metafeatures(X_train, task_id)
         # Calc Exhaustive Feature Selection
         performance = run_leave_one_feature_out(X_train)
         # Save Result
@@ -61,7 +60,8 @@ def main():
         num_outputs=2
     )
     new_prior = PriorDumpDataLoader("../data/prior/new_prior.h5", num_steps=2500,batch_size=32, device=get_default_device())
-    model, history = train(model, new_prior, lr=4e-3, steps_per_eval=25)
+    model, history = train(model, new_prior, lr=4e-3, steps_per_eval=25, checkpoint_path="../utils/tfm/weights_30_09_2026.pt",
+)
     print(model, history)
 
 

@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -203,8 +204,7 @@ class NanoTabPFNClassifier():
         return predicted_probabilities.argmax(axis=1)
 
 
-def train(model: NanoTabPFNModel, prior: DataLoader,
-          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None):
+def train(model: NanoTabPFNModel, prior: DataLoader, lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None, checkpoint_path=None):
     """
     Trains our model on the given prior using the given criterion.
 
@@ -276,5 +276,28 @@ def train(model: NanoTabPFNModel, prior: DataLoader,
                 print(f"time {train_time:7.1f}s | loss {total_loss:7.4f}")
     except KeyboardInterrupt:
         pass
+
+    if checkpoint_path is not None:
+        model.eval()
+        optimizer.eval()  # important for AdamWScheduleFree
+
+        path = Path(checkpoint_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "model_config": {
+                    "embedding_size": 96,
+                    "num_attention_heads": 4,
+                    "mlp_hidden_size": 192,
+                    "num_layers": 3,
+                    "num_outputs": 2,
+                },
+                "target_mode": "binary",
+            },
+            path,
+        )
+        print(f"Saved model checkpoint to {path}")
 
     return model, eval_history
