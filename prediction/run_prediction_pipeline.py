@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from utils.nanoTabPFN_utils import get_default_device
-from utils.tfm.tfm import NanoTabPFNModel, NanoTabPFNClassifier
+from utils.tfm.nanoTabPFN import NanoTabPFNModel, NanoTabPFNClassifier
 
 
 def main():

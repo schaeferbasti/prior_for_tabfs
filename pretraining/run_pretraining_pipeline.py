@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from utils.nanoTabPFN_utils import PriorDumpDataLoader, get_default_device
-from utils.tfm.tfm import NanoTabPFNModel, train
+from utils.tfm.nanoTabPFN import NanoTabPFNModel, train
 
 
 def set_randomness_seed(seed):
