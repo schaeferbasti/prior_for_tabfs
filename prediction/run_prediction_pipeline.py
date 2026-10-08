@@ -21,7 +21,7 @@ def main():
 
     device = get_default_device()
     checkpoint = torch.load(
-        "../utils/tfm/weights_01_10_2026.pt",
+        "../utils/tfm/weights_08_10_2026.pt",
         map_location="cpu",
         weights_only=True,
     )
@@ -29,16 +29,35 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    clf = NanoTabPFNClassifier(model, device)
     X = X.apply(pd.to_numeric, errors="coerce")
     X = X.fillna(0.0).to_numpy(dtype=np.float32)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
-    clf.fit(X_train, y_train)
-    prob = clf.predict_proba(X_test)
-    print(prob)
-    pred = clf.predict(X_test)
-    print(pred)
-    print('Accuracy', accuracy_score(y_test, pred))
+
+    N, D = X.shape  # e.g. N rows, D=12 features
+
+    # Prepare tensors: add batch dimension
+    x = torch.from_numpy(X).float().unsqueeze(0).to(device)  # (1, N, D)
+    y = torch.from_numpy(y).float().unsqueeze(0).to(device)  # (1, N)
+
+    # All rows are “real”; all features are “real”
+    row_mask = torch.ones((1, N), dtype=torch.bool, device=device)
+    feature_mask = torch.ones((1, D), dtype=torch.bool, device=device)
+
+    # Use at least one train and one test row for the internal TFM logic
+    train_test_split_index = max(1, N - 1)
+
+    with torch.no_grad():
+        importance = model(
+            (x, y),
+            train_test_split_index=train_test_split_index,
+            return_feature_importance=True,
+            row_mask=row_mask,
+            feature_mask=feature_mask,
+        )  # shape: (1, D)
+
+    feature_importance = importance[0].cpu().numpy()  # (D,)
+
+    print("Feature importances:", feature_importance)
+    print("Number of features:", len(feature_importance))
 
 
 if __name__ == "__main__":

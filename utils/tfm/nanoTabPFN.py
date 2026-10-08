@@ -24,8 +24,24 @@ class NanoTabPFNModel(nn.Module):
         for _ in range(num_layers):
             self.transformer_blocks.append(TransformerEncoderLayer(embedding_size, num_attention_heads, mlp_hidden_size))
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
+        self.embedding_size = embedding_size
+        self.num_attention_heads = num_attention_heads
 
-    def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int) -> torch.Tensor:
+        # Attention pooling over rows for each feature
+        self.feature_pooler = nn.MultiheadAttention(
+            embed_dim=embedding_size,
+            num_heads=num_attention_heads,
+            batch_first=True,
+        )
+
+        # Shared MLP: (B, D, E) -> (B, D, 1)
+        self.importance_head = nn.Sequential(
+            nn.Linear(embedding_size, embedding_size),
+            nn.GELU(),
+            nn.Linear(embedding_size, 1),
+        )
+
+    def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int, return_feature_importance: bool = False, row_mask: torch.Tensor | None = None, feature_mask: torch.Tensor | None = None) -> torch.Tensor:
         x_src, y_src = src
         # we expect the labels to look like (batches, num_train_datapoints, 1),
         # so we add the last dimension if it is missing
@@ -45,11 +61,56 @@ class NanoTabPFNModel(nn.Module):
         for block in self.transformer_blocks:
             src = block(src, train_test_split_index=train_test_split_index)
         # selects the target embeddings (B,num_targets,1,E)
-        output = src[:, train_test_split_index:, -1, :]
-        # runs the embeddings through the decoder to get
-        # the logits of our predictions (B,num_targets,num_classes)
-        output = self.decoder(output)
-        return output
+        if not return_feature_importance:
+            # Original behavior: row prediction
+            output = src[:, train_test_split_index:, -1, :]
+            output = self.decoder(output)
+            return output
+
+            # NEW: feature-importance path
+        B, R, C, E = src.shape
+        D = C - 1
+        src_features = src[:, :, :D, :]
+
+        # Reshape to (B*C, R, E) to apply attention pooling over rows per feature
+        src_flat = src_features.reshape(B * D, R, E)
+
+        # Build masks for attention pooling
+        if row_mask is None:
+            # All rows are real
+            key_padding_mask = None
+        else:
+            # row_mask: (B, R) -> (B*C, R)
+            key_padding_mask = ~row_mask.repeat_interleave(D, dim=0)  # True = pad
+
+        # Use a learned query vector per feature? For simplicity, use mean-pool-like attention:
+        # We'll use src_flat itself as Q, K, V and let attention learn how to pool.
+        pooled, _ = self.feature_pooler(
+            query=src_flat,
+            key=src_flat,
+            value=src_flat,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )  # (B*C, R, E) but effectively aggregated; we just take mean over R
+
+        # Simple alternative: just mean-pool over rows (often enough)
+        if row_mask is not None:
+            mask = row_mask.repeat_interleave(D, dim=0).unsqueeze(-1)  # (B*C, R, 1)
+            pooled = (src_flat * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp_min(1)
+        else:
+            pooled = src_flat.mean(dim=1)  # (B*C, E)
+
+        # Now pooled: (B*C, E). Reshape to (B, C, E)
+        pooled = pooled.view(B, D, E)
+
+        # Apply shared head to get one scalar per feature
+        importance = self.importance_head(pooled).squeeze(-1)  # (B, C)
+
+        if feature_mask is not None:
+            # Optionally mask padded features
+            importance = importance.masked_fill(~feature_mask, 0.0)
+
+        return importance
 
 
 class FeatureEncoder(nn.Module):
@@ -238,6 +299,7 @@ def train(model: NanoTabPFNModel, prior: DataLoader, lr: float = 1e-4, device: t
         for step, full_data in enumerate(prior):
             step_start_time = time.time()
             train_test_split_index = full_data["train_test_split_index"]
+            """
             data = (full_data["x"].to(device),
                     full_data["y"][:, :train_test_split_index].to(device))
             targets = full_data["y"].to(device)
@@ -248,7 +310,43 @@ def train(model: NanoTabPFNModel, prior: DataLoader, lr: float = 1e-4, device: t
             targets = targets.reshape((-1,)).to(torch.long)
             output = output.view(-1, output.shape[-1])
 
-            loss = criterion(output, targets).mean()
+            loss = criterion(output, targets).mean()"""
+            x = full_data["x"].to(device)  # (B, N, D)
+            y = full_data["y"].to(device)  # (B, N), optional
+            target_imp = full_data["feature_importance"].to(device)  # (B, D)
+
+            feature_mask = full_data.get("feature_mask")
+            if feature_mask is None:
+                # If no mask is provided, assume all features are real.
+                feature_mask = torch.ones_like(target_imp, dtype=torch.bool)
+            feature_mask = feature_mask.to(device)
+
+            row_mask = full_data.get("row_mask")
+            if row_mask is None:
+                row_mask = torch.ones_like(y, dtype=torch.bool)
+            row_mask = row_mask.to(device)
+
+            pred_imp = model(
+                (x, y),
+                train_test_split_index=train_test_split_index,
+                return_feature_importance=True,
+                row_mask=row_mask,
+                feature_mask=feature_mask,
+            )
+
+            if pred_imp.shape != target_imp.shape:
+                raise RuntimeError(
+                    f"Model output shape {tuple(pred_imp.shape)} does not "
+                    f"match target shape {tuple(target_imp.shape)}."
+                )
+
+            # Masked SmoothL1 loss over features
+            loss_per_element = criterion(pred_imp, target_imp)  # (B, D)
+            loss_per_element = loss_per_element * feature_mask.float()
+
+            # Mean over valid (non-padded) entries only
+            n_valid = feature_mask.sum().clamp_min(1)
+            loss = loss_per_element.sum() / n_valid
             loss.backward()
             total_loss = loss.item()
 
