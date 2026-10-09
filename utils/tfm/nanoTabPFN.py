@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.modules.transformer import MultiheadAttention, Linear, LayerNorm
 
-from utils.nanoTabPFN_utils import get_default_device
+from utils.tfm.nanoTabPFN_utils import get_default_device
 
 
 class NanoTabPFNModel(nn.Module):
@@ -288,7 +288,7 @@ def train(model: NanoTabPFNModel, prior: DataLoader, lr: float = 1e-4, device: t
         device = get_default_device()
     model.to(device)
     optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.SmoothL1Loss()
 
     model.train()
     optimizer.train()

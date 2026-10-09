@@ -42,7 +42,7 @@ class PriorDumpDataLoader(DataLoader):
                     self.pointer = 0
                     start = 0
                     end = self.batch_size
-                #end = self.pointer + self.batch_size
+                # end = self.pointer + self.batch_size
                 num_features_batch = f["num_features"][start:end]
                 num_datapoints_batch = f["num_datapoints"][start:end]
                 max_num_features = int(num_features_batch.max())
