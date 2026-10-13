@@ -23,12 +23,7 @@ def run_leave_one_feature_out(X_train):
     """ Run leave-one-feature-out feature selection
     Return: pd.DataFrame with one column called 'improvement', each row represents the respective feature and the value is the improvement in performance when that feature is removed."""
     performance_column = pd.DataFrame(index=X_train.columns, columns=["improvement"])
-    full_score = float(evaluate_data(X_train))
-    for feature_name in X_train.columns:
-        X_without_feature = X_train.drop(columns=feature_name)
-        score_without_feature = float(evaluate_data(X_without_feature))
-        improvement = full_score - score_without_feature
-        performance_column.loc[feature_name, "improvement"] = improvement
+    # TODO: Implement the leave-one-feature-out feature selection logic here. For each feature, remove it from the training data, evaluate the model performance, and store the improvement in the performance_column DataFrame.
     return performance_column
 
 
