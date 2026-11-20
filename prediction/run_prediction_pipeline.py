@@ -1,78 +1,55 @@
-"""Prediction pipeline for TabFS v2: one forward pass per dataset -> one importance score per feature."""
+"""Select features on the test datasets with Kumo's encoder (no training, no fitted model).
+
+Port of `kumo-cls-studies/2026-11-13-encoder-select-catboost/select_features.py` (rule "noise")
+and `select_v2.py` (rule "shadow", the default; it was the better one downstream with CatBoost).
+
+Writes data/test_results/<name>_results.parquet: feature, importance, threshold, selected, rank.
+"""
 
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tabicl._sklearn.preprocessing import PreprocessingPipeline, TransformToNumerical  # noqa: E402
+from utils.fs.kumo_fs import KumoEncoder, prepare_table, select_features  # noqa: E402
 
-from utils.tfm.tabicl_fs import get_default_device, load_tabicl_fs  # noqa: E402
-
-DATASETS = {  # file name in data/test_data -> target column
-    "test_dataset_1": "area",
-    "test_dataset_2": "disease",
-    "test_dataset_3": "HasTumor",
+DATASETS = {  # file name in data/test_data -> (target column, classification?)
+    "test_dataset_1": ("area", False),
+    "test_dataset_2": ("disease", True),
+    "test_dataset_3": ("HasTumor", True),
 }
-# "latest" = most recent utils/tfm/tabicl_fs_*.pt, a path = that checkpoint,
-# None = pretrained TabICLv2 with an untrained readout (zero-shot CLS attention, as a baseline;
-#        scores are then read as relevance logits)
-CHECKPOINT = "latest"
+RULE = "shadow"  # "shadow" (v2) or "noise" (v1)
 RESULTS_DIR = ROOT / "data/test_results"
 
 
-def resolve_checkpoint(checkpoint):
-    if checkpoint != "latest":
-        return checkpoint
-    candidates = sorted((ROOT / "utils/tfm").glob("tabicl_fs_*.pt"), key=lambda p: p.stat().st_mtime)
-    if not candidates:
-        raise FileNotFoundError("No utils/tfm/tabicl_fs_*.pt found. Run the pretraining pipeline first, "
-                                "or set CHECKPOINT = None for the zero-shot baseline.")
-    return candidates[-1]
-
-
-def prepare(df: pd.DataFrame, target: str, max_classes: int) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Same preprocessing as TabICL's sklearn wrapper (one ensemble member, no normalization method)."""
-    X, y = df.drop(columns=[target]), df[target]
-    X_num = TransformToNumerical().fit_transform(X)  # categoricals -> ordinal codes, NaN handling
-    X_num = PreprocessingPipeline(normalization_method="none", outlier_threshold=4.0).fit_transform(X_num)
-
-    # The backbone is a classifier: continuous targets are binned into at most max_classes quantile bins.
-    if pd.api.types.is_numeric_dtype(y) and y.nunique() > max_classes:
-        y = pd.qcut(y, q=max_classes, labels=False, duplicates="drop")
-    y = LabelEncoder().fit_transform(y.astype(str) if not pd.api.types.is_numeric_dtype(y) else y)
-    return X_num.astype(np.float32), y.astype(np.float32), list(X.columns)
-
-
 def main():
-    checkpoint = resolve_checkpoint(CHECKPOINT)
-    print(f"Checkpoint: {checkpoint or 'pretrained TabICLv2 (untrained readout)'}")
-    model = load_tabicl_fs(checkpoint)
-    device = get_default_device()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    for name, target in DATASETS.items():
+    encoders = {}
+    for name, (target, classification) in DATASETS.items():
         df = pd.read_parquet(ROOT / "data/test_data" / f"{name}.parquet")
-        X, y, columns = prepare(df, target, model.backbone.max_classes)
-        score = model.feature_importance(X, y, device=device)
-        value, selected = model.scores_to_selection(score)
-        value_name = {"relevance": "p_relevant", "gating": "gate", "loco": "loco_importance"}[model.objective]
+        X, y, scored, always = prepare_table(df.drop(columns=[target]), df[target], classification)
+        task = "classification" if classification else "regression"
+        if task not in encoders:
+            encoders[task] = KumoEncoder(task)
+        res = select_features(encoders[task], X, y, rule=RULE)
 
-        result = (
-            pd.DataFrame({"feature": columns, "score": score, value_name: value, "selected": selected})
-            .sort_values("score", ascending=False)
-            .reset_index(drop=True)
-        )
+        result = pd.DataFrame({
+            "feature": scored,
+            "importance": [res["importance"][c] for c in scored],
+            "threshold": [res["threshold"][c] for c in scored],
+            "selected": [c in res["kept"] for c in scored],
+        })
+        result["margin"] = result.importance - result.threshold
+        result = result.sort_values("margin", ascending=False).reset_index(drop=True)
         result["rank"] = np.arange(1, len(result) + 1)
         result.to_parquet(RESULTS_DIR / f"{name}_results.parquet", index=False)
 
-        print(f"\n{name}: {X.shape[0]} rows, {X.shape[1]} features, {len(np.unique(y))} classes "
-              f"| objective {model.objective} | selected {int(selected.sum())}/{len(selected)}")
+        print(f"\n{name}: {len(X)} rows, {len(scored)} scored features ({len(always)} always kept: {always}) "
+              f"| {task} | rule {RULE} | selected {int(result.selected.sum())}/{len(result)}")
         print(result.head(15).to_string(index=False))
 
 

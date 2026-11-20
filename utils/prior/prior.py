@@ -1,208 +1,133 @@
-"""Feature-selection prior: synthetic tasks from TabICL's SCM prior + per-feature targets.
+"""Synthetic tasks with known feature relevance, as in the co-worker's study
+`kumo-cls-studies/2026-11-13-encoder-importance-prior/run.py`.
 
-Kumo Tabular's own data generator is not released; NVIDIA describes its training as similar to
-TabICLv2, whose SCM prior ships with the ``tabicl`` package. Tasks are generated with
-``utils.prior.relevance.RelevanceSCMPrior`` (identical tasks to ``tabicl.prior``) which also returns
-ground-truth relevance labels from the generating causal graph (see relevance.py).
+Generator: TabICL v2's graph-SCM prior (`tabicl.prior.graph_lib`, the same code that kumo_prune vendors as
+`_vendor/nanotabiclv2/prior.py`). Stage-1 shapes: 1024 rows, 1-100 features, train fraction 0.3-0.9;
+50% regression, 50% classification (2-10 classes). Only the training rows are returned.
 
-Targets stored per feature:
-    relevance               always   1 = feature is in y's Markov boundary (not d-separated from y given
-                                     the other features), 0 = irrelevant; from the generator, noise-free
-    feature_importance      optional LOCO = score(all) - score(all but feature), mean over repeats
-    feature_importance_std  optional LOCO std over repeats
+Ground truth per feature, from the DAG: relevant = the feature's node and the target's node share an ancestor
+(this includes being the same node, an ancestor or a descendant); independent = no common ancestor.
+This is looser than the Markov boundary: ~87% of features are relevant.
 
-HDF5 layout (N tasks, padded to T_max rows and H_max features):
-    X (N, T_max, H_max) float32 standardized by the prior, zero padded
-    y (N, T_max) float32 class labels, -1 padded
-    num_features, num_datapoints, train_size (N,) int
-    relevance (N, H_max) int8, -1 padded
-    feature_importance, feature_importance_std (N, H_max) float32, NaN padded (only if LOCO was computed)
+Differences from the original (not reproducible here):
+- `kumo_prune` is private. Its `STAGE_CONFIG` is approximated by `STAGE_CONFIG` below ("filters on").
+  Ask the co-worker for the exact config and replace it.
 """
 
 from __future__ import annotations
 
-import json
-import random
-import time
-from pathlib import Path
+import signal
 
-import h5py
 import numpy as np
 import torch
-from joblib import Parallel, delayed
 
-from utils.fs.fs import run_leave_one_feature_out
+from tabicl.prior._dataset import SCMPrior, should_filter
+from tabicl.prior._reg2cls import outlier_removing, standard_scaling
+from tabicl.prior.graph_lib import _dataset as graph_dataset
+from tabicl.prior.graph_lib._base import Context, DatasetProperties
+from tabicl.prior.graph_lib._config import PriorConfig
+from tabicl.prior.graph_lib._graph_function import RandomGraphFunction
+from tabicl.prior.graph_lib._properties import sample_categorical_sizes
 
-DEFAULT_PRIOR_KWARGS = dict(
-    prior_type="mix_scm",  # MLP- and tree-based SCMs, as in TabICL
-    min_features=3,
-    max_features=20,
-    max_classes=10,
-    min_seq_len=100,
-    max_seq_len=500,
-    batch_size_per_gp=4,
+SEQ_LEN = 1024
+MAX_FEATURES = 100
+GEN_TIMEOUT_S = 20  # a few prior draws take minutes on the CPU; they are skipped (as in the original)
+
+# Approximation of kumo_prune's STAGE_CONFIG: graph prior defaults with the dataset filters switched on.
+STAGE_CONFIG = PriorConfig(
+    filter_unpredictable_graphs=True,
+    filter_unpredictable_datasets=True,
+    remove_trivial_datasets=True,
 )
 
+# ---- record the DAG and the feature -> node assignment of the last sampled graph (same hook as the original)
+_last: dict = {}
+_orig_init = RandomGraphFunction.__init__
 
-def _loco_for_task(X: np.ndarray, y: np.ndarray, n_repeats: int) -> tuple[np.ndarray, np.ndarray]:
-    result = run_leave_one_feature_out(X, y, n_repeats=n_repeats, n_jobs=1)
-    return result["improvement"].to_numpy(np.float32), result["improvement_std"].to_numpy(np.float32)
+
+def _init(self, context, dag, node_feature_specs):
+    _orig_init(self, context, dag, node_feature_specs)
+    _last["dag"], _last["specs"] = dag, node_feature_specs
 
 
-def build_prior(
-    output_path: str | Path,
-    n_tasks: int,
-    prior_kwargs: dict | None = None,
-    n_loco_repeats: int = 0,
-    chunk_size: int = 64,
-    n_jobs: int = -1,
-    seed: int = 0,
-) -> None:
-    """Generate ``n_tasks`` tasks with relevance labels; also LOCO targets if ``n_loco_repeats > 0``."""
-    from tabicl.prior._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+RandomGraphFunction.__init__ = _init  # patched on the class, so graph_lib's own reference sees it too
 
-    from utils.prior.relevance import RelevanceSCMPrior
 
-    prior_kwargs = {**DEFAULT_PRIOR_KWARGS, **(prior_kwargs or {})}
-    T_max, H_max = prior_kwargs["max_seq_len"], prior_kwargs["max_features"]
-    with_loco = n_loco_repeats > 0
+def ancestors(dag, node) -> set:
+    """``dag[i]`` lists the parents of node i. Returns the node and all its ancestors."""
+    seen, stack = {node}, [node]
+    while stack:
+        for p in dag[stack.pop()]:
+            if p not in seen:
+                seen.add(p)
+                stack.append(p)
+    return seen
 
-    random.seed(seed)
+
+def sample_dataset(rng: np.random.Generator, config: PriorConfig = STAGE_CONFIG):
+    """One task: (X_train (R, C) float, y_train (R,), relevant (C,) bool, regression bool)."""
+    regression = bool(rng.random() < 0.5)
+    train_size = int(rng.uniform(0.3, 0.9) * SEQ_LEN)
+    num_features = round(rng.uniform(1, SCMPrior.adjust_max_features(SEQ_LEN, MAX_FEATURES)))
+    num_classes = None if regression else int(rng.integers(2, 11))
+    while True:
+        context = Context(config=config)
+        cat_sizes = {"x": sample_categorical_sizes(num_features, context, max_cat_size=200),
+                     "y": [0 if regression else num_classes]}
+        props = DatasetProperties(n_train=SEQ_LEN, n_test=0, cat_sizes=cat_sizes)
+        ds = graph_dataset.RandomDataset(context).sample(props)
+        dag, specs = _last["dag"], _last["specs"]
+        data = ds.get_concat_tensors()
+        names = [n for n, s in props.feature_specs.items() if s.group == "x" and s.cat_size > 1] + \
+                [n for n, s in props.feature_specs.items() if s.group == "x" and s.cat_size <= 1]
+        X = torch.cat([t for t in (data.get("x_cat"), data.get("x_num")) if t is not None], -1)
+        if X.shape[-1] != len(names):
+            continue
+        X = standard_scaling(outlier_removing(X.float(), threshold=4))
+        if regression:
+            y = standard_scaling(outlier_removing(data["y_num"].float(), threshold=4)).view(-1)
+        else:
+            y = data["y_cat"].view(-1).long()
+        if torch.isnan(X).any() or torch.isnan(y.float()).any():
+            continue
+        node_of = {n: i for i, s in enumerate(specs) for n in s}
+        anc_y = ancestors(dag, node_of["y_0"])
+        rel = np.array([bool(ancestors(dag, node_of[n]) & anc_y) for n in names])
+        keep = (X[:train_size].std(0) > 1e-6).numpy()  # drop constant columns
+        if keep.sum() < 2:
+            continue
+        X, rel = X[:, keep], rel[keep]
+        if not regression and not SCMPrior.cls_sanity_check(X[None], y[None], train_size):
+            continue
+        if should_filter(X, y, config, is_classif=not regression):
+            continue
+        perm = rng.permutation(X.shape[1])
+        return X[:train_size, perm], y[:train_size], rel[perm], regression
+
+
+class _GenTimeout(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise _GenTimeout
+
+
+def iter_tasks(n: int, seed: int = 0):
+    """Yield ``n`` tasks; draws slower than GEN_TIMEOUT_S are skipped. Seeds numpy/torch globally like the original."""
+    signal.signal(signal.SIGALRM, _alarm)
+    rng = np.random.default_rng(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    prior = RelevanceSCMPrior(
-        batch_size=chunk_size, fixed_hp=DEFAULT_FIXED_HP, sampled_hp=DEFAULT_SAMPLED_HP, **prior_kwargs
-    )
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    start = time.time()
-
-    with h5py.File(output_path, "w") as f:
-        X_ds = f.create_dataset("X", (n_tasks, T_max, H_max), "float32", chunks=(1, T_max, H_max), compression="gzip")
-        y_ds = f.create_dataset("y", (n_tasks, T_max), "float32", chunks=(1, T_max), compression="gzip")
-        rel_ds = f.create_dataset("relevance", (n_tasks, H_max), "int8")
-        nf_ds = f.create_dataset("num_features", (n_tasks,), "int64")
-        nd_ds = f.create_dataset("num_datapoints", (n_tasks,), "int64")
-        ts_ds = f.create_dataset("train_size", (n_tasks,), "int64")
-        if with_loco:
-            imp_ds = f.create_dataset("feature_importance", (n_tasks, H_max), "float32")
-            std_ds = f.create_dataset("feature_importance_std", (n_tasks, H_max), "float32")
-        f.attrs["prior_kwargs"] = json.dumps(prior_kwargs)
-        f.attrs["relevance_definition"] = (
-            "1 iff the feature is not d-separated from y given all other observed features in the "
-            "generating SCM graph (strong relevance / Markov boundary)"
-        )
-        if with_loco:
-            f.attrs["loco_definition"] = (
-                f"score(all) - score(all but feature), mean over {n_loco_repeats} random 70/30 splits of all "
-                "rows; Random Forest teacher; binary: ROC-AUC, multiclass: -log-loss"
-            )
-
-        written = 0
-        while written < n_tasks:
-            X, y, d, seq_lens, train_sizes, relevance = prior.get_batch_with_relevance()
-            tasks = []
-            for i in range(len(d)):
-                H, T = int(d[i]), int(seq_lens[i])
-                Xi, yi = X[i, :T, :H].numpy(), y[i, :T].numpy()
-                if len(np.unique(yi)) < 2:
-                    continue  # degenerate task
-                tasks.append((Xi, yi, int(train_sizes[i]), relevance[i]))
-            tasks = tasks[: n_tasks - written]
-
-            if with_loco:
-                loco = Parallel(n_jobs=n_jobs)(delayed(_loco_for_task)(Xi, yi, n_loco_repeats) for Xi, yi, _, _ in tasks)
-            else:
-                loco = [None] * len(tasks)
-
-            for (Xi, yi, ts, rel), loco_i in zip(tasks, loco):
-                T, H = Xi.shape
-                X_pad = np.zeros((T_max, H_max), np.float32)
-                X_pad[:T, :H] = Xi
-                y_pad = np.full(T_max, -1, np.float32)
-                y_pad[:T] = yi
-                rel_pad = np.full(H_max, -1, np.int8)
-                rel_pad[:H] = rel
-                X_ds[written], y_ds[written], rel_ds[written] = X_pad, y_pad, rel_pad
-                nf_ds[written], nd_ds[written], ts_ds[written] = H, T, ts
-                if with_loco:
-                    for ds, values in zip((imp_ds, std_ds), loco_i):
-                        padded = np.full(H_max, np.nan, np.float32)
-                        padded[:H] = values
-                        ds[written] = padded
-                written += 1
-
-            print(f"prior: {written}/{n_tasks} tasks ({time.time() - start:.0f}s)")
-
-    print(f"Saved prior with {n_tasks} tasks to {output_path}")
-
-
-class PriorTasks:
-    """In-memory view of a prior file that serves one task at a time (no padding)."""
-
-    def __init__(self, path: str | Path, indices: np.ndarray | None = None):
-        with h5py.File(path, "r") as f:
-            self.X = f["X"][:]
-            self.y = f["y"][:]
-            self.relevance = f["relevance"][:] if "relevance" in f else None
-            self.importance = f["feature_importance"][:] if "feature_importance" in f else None
-            self.num_features = f["num_features"][:]
-            self.num_datapoints = f["num_datapoints"][:]
-            self.train_size = f["train_size"][:]
-        self.path = path
-        self.indices = np.arange(len(self.X)) if indices is None else np.asarray(indices)
-
-    @property
-    def has_relevance(self) -> bool:
-        return self.relevance is not None
-
-    @property
-    def has_loco(self) -> bool:
-        return self.importance is not None
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def task(self, k: int) -> dict:
-        i = self.indices[k]
-        H, T = int(self.num_features[i]), int(self.num_datapoints[i])
-        task = dict(
-            X=torch.from_numpy(self.X[i, :T, :H]),
-            y=torch.from_numpy(self.y[i, :T]),
-            train_size=int(self.train_size[i]),
-        )
-        if self.has_relevance:
-            task["relevance"] = torch.from_numpy(self.relevance[i, :H].astype(np.float32))
-        if self.has_loco:
-            task["importance"] = torch.from_numpy(self.importance[i, :H])
-        return task
-
-    def split(self, val_fraction: float, seed: int = 0) -> tuple["PriorTasks", "PriorTasks"]:
-        perm = np.random.default_rng(seed).permutation(self.indices)
-        n_val = max(1, int(round(val_fraction * len(perm))))
-        return self._subset(perm[n_val:]), self._subset(perm[:n_val])
-
-    def _subset(self, indices: np.ndarray) -> "PriorTasks":
-        view = object.__new__(PriorTasks)
-        view.__dict__.update(self.__dict__)
-        view.indices = np.asarray(indices)
-        return view
-
-    def _values(self, key: str) -> np.ndarray:
-        return np.concatenate([self.task(k)[key].numpy() for k in range(len(self))])
-
-    def target_std(self) -> float:
-        return float(self._values("importance").std())
-
-    def relevance_rate(self) -> float:
-        return float(self._values("relevance").mean())
-
-    def iterate(self, tasks_per_step: int, seed: int = 0):
-        """Infinite iterator over lists of tasks; reshuffles after every pass over the data."""
-        tasks_per_step = min(tasks_per_step, len(self))
-        rng = np.random.default_rng(seed)
+    skipped = 0
+    for _ in range(n):
         while True:
-            order = rng.permutation(len(self))
-            for start in range(0, len(order) - tasks_per_step + 1, tasks_per_step):
-                yield [self.task(k) for k in order[start : start + tasks_per_step]]
+            signal.alarm(GEN_TIMEOUT_S)
+            try:
+                task = sample_dataset(rng)
+                break
+            except _GenTimeout:
+                skipped += 1
+            finally:
+                signal.alarm(0)
+        yield task, skipped
